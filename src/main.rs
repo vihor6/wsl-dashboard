@@ -17,6 +17,7 @@ mod ui;
 mod config;
 mod app;
 mod i18n;
+mod store_create;
 
 // Import Slint UI components
 slint::include_modules!();
@@ -182,6 +183,7 @@ async fn main() {
 
     // Automatically check for updates and expiration at startup
     app::startup::spawn_check_task(app_handle.clone(), app_state.clone());
+    app::startup::spawn_store_create_recovery_check(app_handle.clone(), app_state.clone());
 
     // Show window and center it only if NOT in silent mode
     if !is_silent_mode {
@@ -215,4 +217,3 @@ async fn main() {
     // Processing after application exit
     app::tasks::handle_app_exit(&app, &app_state).await;
 }
-

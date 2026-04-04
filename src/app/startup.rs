@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use slint::ComponentHandle;
@@ -121,5 +122,55 @@ pub fn spawn_check_task(app_handle: slint::Weak<AppWindow>, app_state: Arc<Mutex
                 });
             }
         }
+    });
+}
+
+pub fn spawn_store_create_recovery_check(
+    app_handle: slint::Weak<AppWindow>,
+    app_state: Arc<Mutex<AppState>>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let (temp_location, is_silent_mode) = {
+            let state = app_state.lock().await;
+            (
+                state.config_manager.get_settings().temp_location.clone(),
+                state.is_silent_mode,
+            )
+        };
+
+        if is_silent_mode {
+            return;
+        }
+
+        let base_dir = PathBuf::from(temp_location);
+        let journal_paths = crate::store_create::list_journals(&base_dir);
+        let Some(journal_path) = journal_paths.into_iter().next() else {
+            return;
+        };
+
+        let Ok(journal) = crate::store_create::load_journal(&journal_path) else {
+            warn!(
+                "Store-create recovery check found an unreadable journal at {}",
+                journal_path.display()
+            );
+            return;
+        };
+
+        let payload = format!("store-create-recovery:{}", journal_path.display());
+        let message = format!(
+            "Detected an interrupted Store instance creation for '{}'. Existing instances were preserved. You can clean up the unfinished residue and reopen the add flow.",
+            journal.request.target_name
+        );
+
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = app_handle.upgrade() {
+                app.set_current_message(message.into());
+                app.set_current_message_action("Clean up and retry".into());
+                app.set_copy_script_content(payload.into());
+                app.set_show_message_dialog(true);
+            }
+        });
     });
 }
