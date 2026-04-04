@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -83,6 +84,7 @@ pub enum RecoveryAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreCreateJournal {
     pub operation_id: String,
+    pub created_at: String,
     pub request: StoreCreateRequest,
     pub phase: StoreCreatePhase,
     pub cleanup: CleanupPlan,
@@ -98,6 +100,7 @@ impl StoreCreateJournal {
     ) -> Self {
         Self {
             operation_id: operation_id.into(),
+            created_at: Utc::now().to_rfc3339(),
             request,
             phase: StoreCreatePhase::JournalCreated,
             cleanup,

@@ -126,4 +126,5 @@ fn journal_round_trips_phase_cleanup_and_seed_origin() {
     assert_eq!(decoded.phase, StoreCreatePhase::Recoverable);
     assert!(decoded.seed_created_by_operation);
     assert_eq!(decoded.cleanup, journal.cleanup);
+    assert_eq!(decoded.created_at, journal.created_at);
 }

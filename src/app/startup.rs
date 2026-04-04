@@ -172,7 +172,7 @@ pub fn spawn_store_create_recovery_check(
             }
         }
 
-        journals.sort_by(|(left_path, _), (right_path, _)| left_path.cmp(right_path));
+        journals.sort_by(|(_, left), (_, right)| left.created_at.cmp(&right.created_at));
 
         let Some((_, latest_journal)) = journals.last() else {
             return;

@@ -54,13 +54,18 @@ pub fn setup(app: &AppWindow, app_handle: slint::Weak<AppWindow>, app_state: Arc
             }
             journal_paths.sort();
 
-            let mut latest_request = None;
-
+            let mut journals = Vec::new();
             for journal_path in journal_paths {
                 let Ok(journal) = crate::store_create::load_journal(&journal_path) else {
                     continue;
                 };
+                journals.push((journal_path, journal));
+            }
+            journals.sort_by(|(_, left), (_, right)| left.created_at.cmp(&right.created_at));
 
+            let mut latest_request = None;
+
+            for (journal_path, journal) in journals {
                 let mut cleanup_safe = true;
 
                 for action in journal.recovery_actions() {
