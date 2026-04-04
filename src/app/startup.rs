@@ -146,23 +146,50 @@ pub fn spawn_store_create_recovery_check(
 
         let base_dir = PathBuf::from(temp_location);
         let journal_paths = crate::store_create::list_journals(&base_dir);
-        let Some(journal_path) = journal_paths.into_iter().next() else {
+        let mut journals = Vec::new();
+        for journal_path in journal_paths {
+            match crate::store_create::load_journal(&journal_path) {
+                Ok(journal) => {
+                    if matches!(journal.phase, crate::store_create::plan::StoreCreatePhase::Completed) {
+                        for owned_path in &journal.cleanup.owned_paths {
+                            let _ = crate::store_create::remove_ownership_marker(
+                                owned_path,
+                                &journal.operation_id,
+                            );
+                        }
+                        let _ = crate::store_create::remove_journal(&journal_path);
+                        continue;
+                    }
+                    journals.push((journal_path, journal))
+                }
+                Err(err) => {
+                    warn!(
+                        "Store-create recovery check found an unreadable journal at {}: {}",
+                        journal_path.display(),
+                        err
+                    );
+                }
+            }
+        }
+
+        journals.sort_by(|(left_path, _), (right_path, _)| left_path.cmp(right_path));
+
+        let Some((_, latest_journal)) = journals.last() else {
             return;
         };
 
-        let Ok(journal) = crate::store_create::load_journal(&journal_path) else {
-            warn!(
-                "Store-create recovery check found an unreadable journal at {}",
-                journal_path.display()
-            );
-            return;
+        let payload = format!("store-create-recovery-root:{}", base_dir.display());
+        let message = if journals.len() == 1 {
+            format!(
+                "An interrupted Store instance creation for '{}' was detected. Cleanup will target only managed temporary residue before reopening the add flow.",
+                latest_journal.request.target_name
+            )
+        } else {
+            format!(
+                "Detected {} interrupted Store instance creations. Cleanup will target only managed temporary residue, then reopen the most recent add flow.",
+                journals.len()
+            )
         };
-
-        let payload = format!("store-create-recovery:{}", journal_path.display());
-        let message = format!(
-            "Detected an interrupted Store instance creation for '{}'. Existing instances were preserved. You can clean up the unfinished residue and reopen the add flow.",
-            journal.request.target_name
-        );
 
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = app_handle.upgrade() {

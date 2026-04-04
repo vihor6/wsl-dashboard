@@ -3,7 +3,9 @@ use tokio::sync::Mutex;
 use std::path::PathBuf;
 use tracing::{info, error};
 use crate::{AppState, AppWindow, i18n};
-use crate::store_create::plan::{CleanupPlan, StoreCreateJournal, StoreCreatePhase, StoreCreateRequest};
+use crate::store_create::plan::{
+    choose_strategy, CapabilityProbe, StoreCreateJournal, StoreCreatePhase, StoreCreateRequest,
+};
 use crate::ui::data::refresh_distros_ui;
 use super::{sanitize_instance_name, generate_random_suffix};
 
@@ -169,29 +171,19 @@ pub async fn perform_install(
                 install_path.clone()
             };
             let seed_exists = distro_snapshot.iter().any(|d| d.name == real_id);
-            let archive_path = PathBuf::from(config_manager.get_settings().temp_location.clone())
-                .join(format!("wsl_store_create_{}.tar", uuid::Uuid::new_v4()))
-                .to_string_lossy()
-                .to_string();
-            let cleanup = if seed_exists || final_name == real_id {
-                CleanupPlan {
-                    owned_distros: vec![final_name.clone()],
-                    owned_paths: vec![final_target_path.clone()],
-                    archive_path: Some(archive_path.clone()),
-                }
-            } else {
-                CleanupPlan {
-                    owned_distros: vec![real_id.clone(), final_name.clone()],
-                    owned_paths: vec![final_target_path.clone()],
-                    archive_path: Some(archive_path.clone()),
-                }
-            };
             let request = StoreCreateRequest::new(
                 final_name.clone(),
                 final_target_path.clone(),
                 real_id.clone(),
             );
-            let journal = StoreCreateJournal::new(uuid::Uuid::new_v4().to_string(), request, cleanup);
+            let store_plan = choose_strategy(CapabilityProbe::Unknown, seed_exists, &real_id, &request);
+            let archive_path = store_plan.archive_path.clone().unwrap_or_default();
+            let journal = StoreCreateJournal::new(
+                uuid::Uuid::new_v4().to_string(),
+                request,
+                store_plan.cleanup.clone(),
+                store_plan.seed_created_by_operation,
+            );
             let journal_root = PathBuf::from(config_manager.get_settings().temp_location.clone());
             let journal_path = match crate::store_create::save_journal(&journal_root, &journal) {
                 Ok(path) => path,
@@ -271,7 +263,7 @@ pub async fn perform_install(
                 let ah_ui = ah.clone();
                 let initial_tb = terminal_buffer.clone();
                 let ui_task = tokio::spawn(async move {
-                    let mut buffer = initial_tb;
+                    let buffer = initial_tb;
                     let mut dot_count = 0;
                     let mut interval = tokio::time::interval(std::time::Duration::from_millis(800));
 
@@ -357,6 +349,22 @@ pub async fn perform_install(
 
                     terminal_buffer.push_str("...\n");
                     if distro_registered {
+                        if journal.seed_created_by_operation {
+                            if let Some(seed_install_path) = executor
+                                .get_distro_install_location(&real_id)
+                                .await
+                                .data
+                            {
+                                let _ = crate::store_create::register_owned_path(
+                                    &journal_path,
+                                    seed_install_path.clone(),
+                                );
+                                let _ = crate::store_create::create_ownership_marker(
+                                    &seed_install_path,
+                                    &journal.operation_id,
+                                );
+                            }
+                        }
                         let _ = crate::store_create::update_journal_phase(&journal_path, StoreCreatePhase::SeedReady);
                         seed_ready = true;
                     } else {
@@ -408,15 +416,27 @@ pub async fn perform_install(
                     if error_msg.is_empty() {
                         let final_path_clone = final_target_path.clone();
                         let _ = tokio::task::spawn_blocking(move || std::fs::create_dir_all(&final_path_clone)).await;
+                        let _ = crate::store_create::create_ownership_marker(
+                            &final_target_path,
+                            &journal.operation_id,
+                        );
                         let import_res = executor.execute_command(&["--import", &final_name, &final_target_path, &archive_path]).await;
                         if import_res.success {
                             success = true;
                             terminal_buffer.push_str(&format!("{}\n", i18n::t("install.step_8")));
                             terminal_buffer.push_str(&format!("{}\n", i18n::t("install.step_9")));
+                            let _ = crate::store_create::update_journal_phase(
+                                &journal_path,
+                                StoreCreatePhase::Completed,
+                            );
                             let _ = tokio::task::spawn_blocking({
                                 let archive_path = archive_path.clone();
                                 move || std::fs::remove_file(&archive_path)
                             }).await;
+                            let _ = crate::store_create::remove_ownership_marker(
+                                &final_target_path,
+                                &journal.operation_id,
+                            );
                             let _ = crate::store_create::remove_journal(&journal_path);
                         } else {
                             let recovery_detail = if seed_exists {

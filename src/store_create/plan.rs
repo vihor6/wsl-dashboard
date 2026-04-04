@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const STAGING_PREFIX: &str = "wsl-dashboard-store-stage";
 pub const JOURNAL_DIR_NAME: &str = "operations";
+pub const OWNERSHIP_MARKER_PREFIX: &str = ".wsl-dashboard-store-create";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapabilityProbe {
@@ -14,7 +14,7 @@ pub enum CapabilityProbe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoreCreateStrategy {
     DirectInstall,
-    FreshStagedPromote,
+    FreshSeedPromote,
     ExistingSeedPromote,
 }
 
@@ -64,6 +64,12 @@ impl CleanupPlan {
     pub fn owns_path(&self, path: &str) -> bool {
         self.owned_paths.iter().any(|owned| owned == path)
     }
+
+    pub fn register_owned_path(&mut self, path: String) {
+        if !self.owns_path(&path) {
+            self.owned_paths.push(path);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +86,7 @@ pub struct StoreCreateJournal {
     pub request: StoreCreateRequest,
     pub phase: StoreCreatePhase,
     pub cleanup: CleanupPlan,
+    pub seed_created_by_operation: bool,
 }
 
 impl StoreCreateJournal {
@@ -87,17 +94,46 @@ impl StoreCreateJournal {
         operation_id: impl Into<String>,
         request: StoreCreateRequest,
         cleanup: CleanupPlan,
+        seed_created_by_operation: bool,
     ) -> Self {
         Self {
             operation_id: operation_id.into(),
             request,
             phase: StoreCreatePhase::JournalCreated,
             cleanup,
+            seed_created_by_operation,
         }
     }
 
     pub fn advance_to(&mut self, phase: StoreCreatePhase) {
         self.phase = phase;
+    }
+
+    pub fn can_cleanup_distro(&self, distro_name: &str, current_install_path: Option<&str>) -> bool {
+        if !self.cleanup.owns_distro(distro_name) {
+            return false;
+        }
+
+        if distro_name == self.request.target_name {
+            return current_install_path == Some(self.request.target_path.as_str());
+        }
+
+        if distro_name == self.request.store_id {
+            return self.seed_created_by_operation
+                && current_install_path.is_some()
+                && current_install_path.is_some_and(|path| self.cleanup.owns_path(path));
+        }
+
+        false
+    }
+
+    pub fn can_cleanup_path(&self, install_path: &str) -> bool {
+        self.cleanup.owns_path(install_path)
+            && install_path == self.request.target_path
+    }
+
+    pub fn can_cleanup_archive(&self, archive_path: &str) -> bool {
+        self.cleanup.archive_path.as_deref() == Some(archive_path)
     }
 
     pub fn recovery_actions(&self) -> Vec<RecoveryAction> {
@@ -133,10 +169,9 @@ impl StoreCreateJournal {
 pub struct StoreCreatePlan {
     pub strategy: StoreCreateStrategy,
     pub final_path: String,
-    pub staging_name: Option<String>,
-    pub staging_path: Option<String>,
     pub archive_path: Option<String>,
     pub cleanup: CleanupPlan,
+    pub seed_created_by_operation: bool,
 }
 
 pub fn choose_strategy(
@@ -145,60 +180,56 @@ pub fn choose_strategy(
     real_id: &str,
     request: &StoreCreateRequest,
 ) -> StoreCreatePlan {
-    let operation_id = operation_fragment(&request.target_name);
     let final_path = request.target_path.clone();
+    let can_direct_install = matches!(probe, CapabilityProbe::Supported)
+        && !seed_exists
+        && request.target_name == real_id
+        && request.target_path.trim().is_empty();
 
-    if !seed_exists && request.target_name == real_id {
+    if can_direct_install {
         return StoreCreatePlan {
-            strategy: match probe {
-                CapabilityProbe::Supported => StoreCreateStrategy::DirectInstall,
-                CapabilityProbe::Unsupported | CapabilityProbe::Unknown => {
-                    StoreCreateStrategy::DirectInstall
-                }
-            },
+            strategy: StoreCreateStrategy::DirectInstall,
             final_path: final_path.clone(),
-            staging_name: None,
-            staging_path: None,
             archive_path: None,
             cleanup: CleanupPlan {
                 owned_distros: vec![request.target_name.clone()],
-                owned_paths: vec![final_path],
+                owned_paths: if final_path.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![final_path]
+                },
                 archive_path: None,
             },
+            seed_created_by_operation: false,
         };
     }
 
     if seed_exists {
-        let archive_path = archive_path_for(&request.target_path, &operation_id);
+        let archive_path = archive_path_for(&request.target_path, &operation_fragment(&request.target_name));
         return StoreCreatePlan {
             strategy: StoreCreateStrategy::ExistingSeedPromote,
             final_path: final_path.clone(),
-            staging_name: None,
-            staging_path: None,
             archive_path: Some(archive_path.clone()),
             cleanup: CleanupPlan {
                 owned_distros: vec![request.target_name.clone()],
                 owned_paths: vec![final_path],
                 archive_path: Some(archive_path),
             },
+            seed_created_by_operation: false,
         };
     }
 
-    let staging_name = staging_distro_name(&operation_id);
-    let staging_path = staging_install_path(&request.target_path, &operation_id);
-    let archive_path = archive_path_for(&request.target_path, &operation_id);
-
+    let archive_path = archive_path_for(&request.target_path, &operation_fragment(&request.target_name));
     StoreCreatePlan {
-        strategy: StoreCreateStrategy::FreshStagedPromote,
+        strategy: StoreCreateStrategy::FreshSeedPromote,
         final_path: final_path.clone(),
-        staging_name: Some(staging_name.clone()),
-        staging_path: Some(staging_path.clone()),
         archive_path: Some(archive_path.clone()),
         cleanup: CleanupPlan {
-            owned_distros: vec![staging_name, request.target_name.clone()],
-            owned_paths: vec![staging_path, final_path],
+            owned_distros: vec![request.store_id.clone(), request.target_name.clone()],
+            owned_paths: vec![final_path],
             archive_path: Some(archive_path),
         },
+        seed_created_by_operation: true,
     }
 }
 
@@ -208,20 +239,17 @@ pub fn journal_path(base_dir: &Path, operation_id: &str) -> PathBuf {
         .join(format!("store-create-{}.json", operation_fragment(operation_id)))
 }
 
-pub fn staging_distro_name(operation_id: &str) -> String {
-    format!("{}-{}", STAGING_PREFIX, operation_fragment(operation_id))
-}
-
-pub fn staging_install_path(target_path: &str, operation_id: &str) -> String {
-    parent_dir_for(target_path)
-        .join(format!(".{}-{}", STAGING_PREFIX, operation_fragment(operation_id)))
-        .to_string_lossy()
-        .into_owned()
+pub fn ownership_marker_path(install_path: &str, operation_id: &str) -> PathBuf {
+    PathBuf::from(install_path).join(format!(
+        "{}-{}.marker",
+        OWNERSHIP_MARKER_PREFIX,
+        operation_fragment(operation_id)
+    ))
 }
 
 pub fn archive_path_for(target_path: &str, operation_id: &str) -> String {
     parent_dir_for(target_path)
-        .join(format!("{}.tar", staging_distro_name(operation_id)))
+        .join(format!("wsl_store_create_{}.tar", operation_fragment(operation_id)))
         .to_string_lossy()
         .into_owned()
 }

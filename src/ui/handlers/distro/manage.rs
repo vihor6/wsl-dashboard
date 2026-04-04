@@ -35,60 +35,105 @@ pub fn setup(app: &AppWindow, app_handle: slint::Weak<AppWindow>, app_state: Arc
     let as_ptr = app_state.clone();
     app.on_message_action_clicked(move |payload| {
         let payload = payload.to_string();
-        let Some(path) = payload.strip_prefix("store-create-recovery:") else {
+        let Some(root) = payload.strip_prefix("store-create-recovery-root:") else {
             return;
         };
 
-        let journal_path = PathBuf::from(path);
+        let journal_root = PathBuf::from(root);
         let ah_action = ah_action.clone();
         let as_ptr = as_ptr.clone();
         tokio::spawn(async move {
-            let (executor, journal) = {
+            let executor = {
                 let state = as_ptr.lock().await;
-                (
-                    state.wsl_dashboard.executor().clone(),
-                    crate::store_create::load_journal(&journal_path),
-                )
+                state.wsl_dashboard.executor().clone()
             };
 
-            let Ok(journal) = journal else {
+            let mut journal_paths = crate::store_create::list_journals(&journal_root);
+            if journal_paths.is_empty() {
                 return;
-            };
+            }
+            journal_paths.sort();
 
-            for action in journal.recovery_actions() {
-                match action {
-                    crate::store_create::plan::RecoveryAction::RemoveManagedDistro { distro_name } => {
-                        let _ = executor.execute_command(&["--terminate", &distro_name]).await;
-                        let _ = executor.execute_command(&["--unregister", &distro_name]).await;
-                    }
-                    crate::store_create::plan::RecoveryAction::RemoveManagedPath { install_path } => {
-                        let path = PathBuf::from(&install_path);
-                        if path.exists() {
-                            let _ = std::fs::remove_dir_all(path);
-                        }
-                    }
-                    crate::store_create::plan::RecoveryAction::RemoveManagedArchive { archive_path } => {
-                        let path = PathBuf::from(&archive_path);
-                        if path.exists() {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                    crate::store_create::plan::RecoveryAction::ReopenAddFlow { request } => {
-                        let _ = crate::store_create::remove_journal(&journal_path);
-                        let ah_reopen = ah_action.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(app) = ah_reopen.upgrade() {
-                                app.set_show_message_dialog(false);
-                                app.set_selected_tab(1);
-                                app.set_selected_source_idx(2);
-                                app.set_new_instance_name(request.target_name.into());
-                                app.set_new_instance_path(request.target_path.into());
-                                app.set_selected_install_distro(request.store_id.into());
-                                app.invoke_source_selected(2);
+            let mut latest_request = None;
+
+            for journal_path in journal_paths {
+                let Ok(journal) = crate::store_create::load_journal(&journal_path) else {
+                    continue;
+                };
+
+                let mut cleanup_safe = true;
+
+                for action in journal.recovery_actions() {
+                    match action {
+                        crate::store_create::plan::RecoveryAction::RemoveManagedDistro { distro_name } => {
+                            let install_path = executor
+                                .get_distro_install_location(&distro_name)
+                                .await
+                                .data;
+                            let install_path_ref = install_path.as_deref();
+                            let marker_ok = install_path_ref
+                                .map(|path| crate::store_create::ownership_marker_exists(path, &journal.operation_id))
+                                .unwrap_or(false);
+                            if journal.can_cleanup_distro(&distro_name, install_path_ref) && marker_ok {
+                                let _ = executor.execute_command(&["--terminate", &distro_name]).await;
+                                let _ = executor.execute_command(&["--unregister", &distro_name]).await;
+                            } else {
+                                cleanup_safe = false;
                             }
-                        });
+                        }
+                        crate::store_create::plan::RecoveryAction::RemoveManagedPath { install_path } => {
+                            let marker_ok = crate::store_create::ownership_marker_exists(
+                                &install_path,
+                                &journal.operation_id,
+                            );
+                            if journal.can_cleanup_path(&install_path) && marker_ok {
+                                let path = PathBuf::from(&install_path);
+                                if path.exists() {
+                                    let _ = std::fs::remove_dir_all(path);
+                                }
+                            } else {
+                                cleanup_safe = false;
+                            }
+                        }
+                        crate::store_create::plan::RecoveryAction::RemoveManagedArchive { archive_path } => {
+                            if journal.can_cleanup_archive(&archive_path) {
+                                let path = PathBuf::from(&archive_path);
+                                if path.exists() {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                            } else {
+                                cleanup_safe = false;
+                            }
+                        }
+                        crate::store_create::plan::RecoveryAction::ReopenAddFlow { .. } => {}
                     }
                 }
+
+                if cleanup_safe {
+                    latest_request = Some(journal.request.clone());
+                    for owned_path in &journal.cleanup.owned_paths {
+                        let _ = crate::store_create::remove_ownership_marker(
+                            owned_path,
+                            &journal.operation_id,
+                        );
+                    }
+                    let _ = crate::store_create::remove_journal(&journal_path);
+                }
+            }
+
+            if let Some(request) = latest_request {
+                let ah_reopen = ah_action.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = ah_reopen.upgrade() {
+                        app.set_show_message_dialog(false);
+                        app.set_selected_tab(1);
+                        app.set_selected_source_idx(2);
+                        app.set_new_instance_name(request.target_name.into());
+                        app.set_new_instance_path(request.target_path.into());
+                        app.set_selected_install_distro(request.store_id.into());
+                        app.invoke_source_selected(2);
+                    }
+                });
             }
         });
     });

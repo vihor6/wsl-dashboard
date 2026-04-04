@@ -4,9 +4,9 @@ mod plan;
 use std::path::Path;
 
 use plan::{
-    archive_path_for, choose_strategy, journal_path, staging_distro_name, staging_install_path,
-    CapabilityProbe, RecoveryAction, StoreCreateJournal, StoreCreatePhase, StoreCreateRequest,
-    StoreCreateStrategy, JOURNAL_DIR_NAME, STAGING_PREFIX,
+    archive_path_for, choose_strategy, journal_path, ownership_marker_path, CapabilityProbe,
+    RecoveryAction, StoreCreateJournal, StoreCreatePhase, StoreCreateRequest, StoreCreateStrategy,
+    JOURNAL_DIR_NAME, OWNERSHIP_MARKER_PREFIX,
 };
 
 fn sample_request() -> StoreCreateRequest {
@@ -18,41 +18,40 @@ fn sample_request() -> StoreCreateRequest {
 }
 
 #[test]
-fn direct_install_only_applies_when_real_id_is_free_and_matches_target() {
-    let request = StoreCreateRequest::new("Ubuntu-24.04", r"D:\linux\Ubuntu-24.04", "Ubuntu-24.04");
+fn direct_install_requires_supported_probe_and_unmodified_target() {
+    let request = StoreCreateRequest::new("Ubuntu-24.04", "", "Ubuntu-24.04");
 
     let plan = choose_strategy(CapabilityProbe::Supported, false, "Ubuntu-24.04", &request);
     assert_eq!(plan.strategy, StoreCreateStrategy::DirectInstall);
-    assert!(plan.cleanup.owns_distro("Ubuntu-24.04"));
-    assert!(plan.cleanup.owns_path(r"D:\linux\Ubuntu-24.04"));
 
-    let fallback = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
-    assert_eq!(fallback.strategy, StoreCreateStrategy::ExistingSeedPromote);
+    let fallback = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
+    assert_eq!(fallback.strategy, StoreCreateStrategy::FreshSeedPromote);
 }
 
 #[test]
-fn existing_seed_promote_only_owns_new_instance_and_archive() {
+fn existing_seed_promote_does_not_claim_the_original_seed() {
     let request = sample_request();
     let plan = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
 
     assert_eq!(plan.strategy, StoreCreateStrategy::ExistingSeedPromote);
+    assert!(!plan.seed_created_by_operation);
     assert_eq!(plan.cleanup.owned_distros, vec![request.target_name.clone()]);
     assert_eq!(plan.cleanup.owned_paths, vec![request.target_path.clone()]);
     assert!(plan.cleanup.archive_path.is_some());
-    assert!(!plan.cleanup.owns_distro("Ubuntu-24.04"));
-    assert!(!plan.cleanup.owns_path(r"D:\linux\Ubuntu-24.04"));
 }
 
 #[test]
-fn fresh_staged_promote_tracks_only_journal_owned_residue() {
+fn fresh_seed_promote_tracks_created_seed_and_target() {
     let request = sample_request();
     let plan = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
 
-    assert_eq!(plan.strategy, StoreCreateStrategy::FreshStagedPromote);
-    assert_eq!(plan.cleanup.owned_distros.len(), 2);
-    assert!(plan.cleanup.owns_distro("Ubuntu-24.04-dev"));
-    assert!(plan.cleanup.owned_distros.iter().any(|item| item.starts_with(STAGING_PREFIX)));
-    assert!(plan.cleanup.owned_paths.iter().any(|item| item.contains(STAGING_PREFIX)));
+    assert_eq!(plan.strategy, StoreCreateStrategy::FreshSeedPromote);
+    assert!(plan.seed_created_by_operation);
+    assert_eq!(
+        plan.cleanup.owned_distros,
+        vec!["Ubuntu-24.04".to_string(), request.target_name.clone()]
+    );
+    assert_eq!(plan.cleanup.owned_paths, vec![request.target_path.clone()]);
     assert!(plan.cleanup.archive_path.is_some());
 }
 
@@ -67,10 +66,37 @@ fn journal_path_is_kept_out_of_instances_toml() {
 }
 
 #[test]
-fn journal_recovery_actions_only_target_owned_residue() {
+fn ownership_marker_path_is_scoped_to_operation_and_install_path() {
+    let marker = ownership_marker_path(r"D:\linux\Ubuntu-24.04-dev", "ABC123");
+    let rendered = marker.to_string_lossy();
+
+    assert!(rendered.contains(OWNERSHIP_MARKER_PREFIX));
+    assert!(rendered.ends_with(".marker"));
+    assert!(rendered.contains("abc123"));
+}
+
+#[test]
+fn cleanup_validation_rejects_unowned_distros_and_paths() {
     let request = sample_request();
     let plan = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
-    let journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup.clone());
+    let mut journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, true);
+    journal.cleanup.register_owned_path(r"D:\seed-cache\Ubuntu-24.04".to_string());
+
+    assert!(journal.can_cleanup_distro("Ubuntu-24.04", Some(r"D:\seed-cache\Ubuntu-24.04")));
+    assert!(journal.can_cleanup_distro("Ubuntu-24.04-dev", Some(request.target_path.as_str())));
+    assert!(!journal.can_cleanup_distro("Ubuntu-20.04", Some(r"D:\linux\Ubuntu-20.04")));
+    assert!(!journal.can_cleanup_distro("Ubuntu-24.04", Some(r"D:\linux\Ubuntu-20.04")));
+    assert!(journal.can_cleanup_path(request.target_path.as_str()));
+    assert!(!journal.can_cleanup_path(r"D:\windows\system32"));
+    assert!(journal.can_cleanup_archive(journal.cleanup.archive_path.as_deref().unwrap_or_default()));
+    assert!(!journal.can_cleanup_archive(r"D:\other\archive.tar"));
+}
+
+#[test]
+fn journal_recovery_actions_cover_only_managed_cleanup_and_reopen() {
+    let request = sample_request();
+    let plan = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
+    let journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, false);
 
     let actions = journal.recovery_actions();
     assert!(actions.iter().any(|action| matches!(
@@ -85,35 +111,19 @@ fn journal_recovery_actions_only_target_owned_residue() {
         action,
         RecoveryAction::ReopenAddFlow { request: reopened } if reopened == &request
     )));
-    assert!(!actions.iter().any(|action| matches!(
-        action,
-        RecoveryAction::RemoveManagedDistro { distro_name } if distro_name == "Ubuntu-20.04"
-    )));
 }
 
 #[test]
-fn journal_round_trips_phase_and_cleanup_data() {
+fn journal_round_trips_phase_cleanup_and_seed_origin() {
     let request = sample_request();
     let plan = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
-    let mut journal = StoreCreateJournal::new("phase-op", request, plan.cleanup);
+    let mut journal = StoreCreateJournal::new("phase-op", request, plan.cleanup, true);
     journal.advance_to(StoreCreatePhase::Recoverable);
 
     let encoded = serde_json::to_string(&journal).expect("serialize");
     let decoded: StoreCreateJournal = serde_json::from_str(&encoded).expect("deserialize");
 
     assert_eq!(decoded.phase, StoreCreatePhase::Recoverable);
+    assert!(decoded.seed_created_by_operation);
     assert_eq!(decoded.cleanup, journal.cleanup);
-}
-
-#[test]
-fn generated_staging_metadata_is_opaque() {
-    let op = "ABC123";
-    let staging_name = staging_distro_name(op);
-    let staging_path = staging_install_path(r"D:\linux\Ubuntu-24.04-dev", op);
-    let archive_path = archive_path_for(r"D:\linux\Ubuntu-24.04-dev", op);
-
-    assert!(staging_name.starts_with(STAGING_PREFIX));
-    assert!(!staging_name.contains("Ubuntu"));
-    assert!(staging_path.contains(STAGING_PREFIX));
-    assert!(archive_path.ends_with(".tar"));
 }
