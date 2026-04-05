@@ -4,7 +4,14 @@ use tokio::sync::Mutex;
 use tracing::info;
 use crate::{AppWindow, AppState, i18n};
 use slint::Model;
+use crate::store_create::plan::CleanupDecision;
 use crate::ui::data::refresh_distros_ui;
+
+enum PendingCleanup {
+    Distro(String),
+    Path(PathBuf),
+    Archive(PathBuf),
+}
 
 pub fn setup(app: &AppWindow, app_handle: slint::Weak<AppWindow>, app_state: Arc<Mutex<AppState>>) {
     // Handle message link click (to open startup folder or generic URL)
@@ -67,6 +74,7 @@ pub fn setup(app: &AppWindow, app_handle: slint::Weak<AppWindow>, app_state: Arc
 
             for (journal_path, journal) in journals {
                 let mut cleanup_safe = true;
+                let mut pending_cleanup = Vec::new();
 
                 for action in journal.recovery_actions() {
                     match action {
@@ -79,35 +87,53 @@ pub fn setup(app: &AppWindow, app_handle: slint::Weak<AppWindow>, app_state: Arc
                             let marker_ok = install_path_ref
                                 .map(|path| crate::store_create::ownership_marker_exists(path, &journal.operation_id))
                                 .unwrap_or(false);
-                            if journal.can_cleanup_distro(&distro_name, install_path_ref) && marker_ok {
-                                let _ = executor.execute_command(&["--terminate", &distro_name]).await;
-                                let _ = executor.execute_command(&["--unregister", &distro_name]).await;
-                            } else {
-                                cleanup_safe = false;
+                            match journal.cleanup_distro_decision(
+                                &distro_name,
+                                install_path_ref,
+                                marker_ok,
+                            ) {
+                                CleanupDecision::AlreadyAbsent => {}
+                                CleanupDecision::RemoveNow => {
+                                    pending_cleanup.push(PendingCleanup::Distro(distro_name));
+                                }
+                                CleanupDecision::Unsafe => {
+                                    cleanup_safe = false;
+                                    break;
+                                }
                             }
                         }
                         crate::store_create::plan::RecoveryAction::RemoveManagedPath { install_path } => {
+                            let path = PathBuf::from(&install_path);
                             let marker_ok = crate::store_create::ownership_marker_exists(
                                 &install_path,
                                 &journal.operation_id,
                             );
-                            if journal.can_cleanup_path(&install_path) && marker_ok {
-                                let path = PathBuf::from(&install_path);
-                                if path.exists() {
-                                    let _ = std::fs::remove_dir_all(path);
+                            match journal.cleanup_path_decision(
+                                &install_path,
+                                path.exists(),
+                                marker_ok,
+                            ) {
+                                CleanupDecision::AlreadyAbsent => {}
+                                CleanupDecision::RemoveNow => {
+                                    pending_cleanup.push(PendingCleanup::Path(path));
                                 }
-                            } else {
-                                cleanup_safe = false;
+                                CleanupDecision::Unsafe => {
+                                    cleanup_safe = false;
+                                    break;
+                                }
                             }
                         }
                         crate::store_create::plan::RecoveryAction::RemoveManagedArchive { archive_path } => {
-                            if journal.can_cleanup_archive(&archive_path) {
-                                let path = PathBuf::from(&archive_path);
-                                if path.exists() {
-                                    let _ = std::fs::remove_file(path);
+                            let path = PathBuf::from(&archive_path);
+                            match journal.cleanup_archive_decision(&archive_path, path.exists()) {
+                                CleanupDecision::AlreadyAbsent => {}
+                                CleanupDecision::RemoveNow => {
+                                    pending_cleanup.push(PendingCleanup::Archive(path));
                                 }
-                            } else {
-                                cleanup_safe = false;
+                                CleanupDecision::Unsafe => {
+                                    cleanup_safe = false;
+                                    break;
+                                }
                             }
                         }
                         crate::store_create::plan::RecoveryAction::ReopenAddFlow { .. } => {}
@@ -115,6 +141,20 @@ pub fn setup(app: &AppWindow, app_handle: slint::Weak<AppWindow>, app_state: Arc
                 }
 
                 if cleanup_safe {
+                    for cleanup in pending_cleanup {
+                        match cleanup {
+                            PendingCleanup::Distro(distro_name) => {
+                                let _ = executor.execute_command(&["--terminate", &distro_name]).await;
+                                let _ = executor.execute_command(&["--unregister", &distro_name]).await;
+                            }
+                            PendingCleanup::Path(path) => {
+                                let _ = std::fs::remove_dir_all(path);
+                            }
+                            PendingCleanup::Archive(path) => {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                    }
                     latest_request = Some(journal.request.clone());
                     for owned_path in &journal.cleanup.owned_paths {
                         let _ = crate::store_create::remove_ownership_marker(

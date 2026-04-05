@@ -5,8 +5,8 @@ use std::path::Path;
 
 use plan::{
     archive_path_for, choose_strategy, journal_path, ownership_marker_path, CapabilityProbe,
-    RecoveryAction, StoreCreateJournal, StoreCreatePhase, StoreCreateRequest, StoreCreateStrategy,
-    JOURNAL_DIR_NAME, OWNERSHIP_MARKER_PREFIX,
+    CleanupDecision, RecoveryAction, StoreCreateJournal, StoreCreatePhase, StoreCreateRequest,
+    StoreCreateStrategy, JOURNAL_DIR_NAME, OWNERSHIP_MARKER_PREFIX,
 };
 
 fn sample_request() -> StoreCreateRequest {
@@ -86,9 +86,66 @@ fn cleanup_validation_rejects_unowned_distros_and_paths() {
     assert!(!journal.can_cleanup_distro("Ubuntu-20.04", Some(r"D:\linux\Ubuntu-20.04")));
     assert!(!journal.can_cleanup_distro("Ubuntu-24.04", Some(r"D:\linux\Ubuntu-20.04")));
     assert!(journal.can_cleanup_path(request.target_path.as_str()));
+    assert!(journal.can_cleanup_path(r"D:\seed-cache\Ubuntu-24.04"));
     assert!(!journal.can_cleanup_path(r"D:\windows\system32"));
     assert!(journal.can_cleanup_archive(journal.cleanup.archive_path.as_deref().unwrap_or_default()));
     assert!(!journal.can_cleanup_archive(r"D:\other\archive.tar"));
+}
+
+#[test]
+fn cleanup_decisions_treat_missing_resources_as_already_absent() {
+    let request = sample_request();
+    let plan = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
+    let journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, true);
+
+    assert_eq!(
+        journal.cleanup_distro_decision(&request.target_name, None, false),
+        CleanupDecision::AlreadyAbsent
+    );
+    assert_eq!(
+        journal.cleanup_path_decision(request.target_path.as_str(), false, false),
+        CleanupDecision::AlreadyAbsent
+    );
+    assert_eq!(
+        journal.cleanup_archive_decision(
+            journal.cleanup.archive_path.as_deref().unwrap_or_default(),
+            false,
+        ),
+        CleanupDecision::AlreadyAbsent
+    );
+}
+
+#[test]
+fn cleanup_decisions_require_owned_marked_resources_before_removal() {
+    let request = sample_request();
+    let plan = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
+    let mut journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, true);
+    journal.cleanup.register_owned_path(r"D:\seed-cache\Ubuntu-24.04".to_string());
+
+    assert_eq!(
+        journal.cleanup_distro_decision(
+            "Ubuntu-24.04",
+            Some(r"D:\seed-cache\Ubuntu-24.04"),
+            true,
+        ),
+        CleanupDecision::RemoveNow
+    );
+    assert_eq!(
+        journal.cleanup_path_decision(request.target_path.as_str(), true, true),
+        CleanupDecision::RemoveNow
+    );
+    assert_eq!(
+        journal.cleanup_path_decision(r"D:\seed-cache\Ubuntu-24.04", true, true),
+        CleanupDecision::RemoveNow
+    );
+    assert_eq!(
+        journal.cleanup_distro_decision("Ubuntu-24.04", Some(r"D:\linux\Ubuntu-20.04"), true),
+        CleanupDecision::Unsafe
+    );
+    assert_eq!(
+        journal.cleanup_path_decision(request.target_path.as_str(), true, false),
+        CleanupDecision::Unsafe
+    );
 }
 
 #[test]

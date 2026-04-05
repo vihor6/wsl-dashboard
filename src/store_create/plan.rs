@@ -72,6 +72,13 @@ impl CleanupPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupDecision {
+    AlreadyAbsent,
+    RemoveNow,
+    Unsafe,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryAction {
     RemoveManagedDistro { distro_name: String },
@@ -131,11 +138,58 @@ impl StoreCreateJournal {
 
     pub fn can_cleanup_path(&self, install_path: &str) -> bool {
         self.cleanup.owns_path(install_path)
-            && install_path == self.request.target_path
     }
 
     pub fn can_cleanup_archive(&self, archive_path: &str) -> bool {
         self.cleanup.archive_path.as_deref() == Some(archive_path)
+    }
+
+    pub fn cleanup_distro_decision(
+        &self,
+        distro_name: &str,
+        current_install_path: Option<&str>,
+        marker_present: bool,
+    ) -> CleanupDecision {
+        match current_install_path {
+            None => CleanupDecision::AlreadyAbsent,
+            Some(path) if self.can_cleanup_distro(distro_name, Some(path)) && marker_present => {
+                CleanupDecision::RemoveNow
+            }
+            Some(_) => CleanupDecision::Unsafe,
+        }
+    }
+
+    pub fn cleanup_path_decision(
+        &self,
+        install_path: &str,
+        path_exists: bool,
+        marker_present: bool,
+    ) -> CleanupDecision {
+        if !path_exists {
+            return CleanupDecision::AlreadyAbsent;
+        }
+
+        if self.can_cleanup_path(install_path) && marker_present {
+            return CleanupDecision::RemoveNow;
+        }
+
+        CleanupDecision::Unsafe
+    }
+
+    pub fn cleanup_archive_decision(
+        &self,
+        archive_path: &str,
+        path_exists: bool,
+    ) -> CleanupDecision {
+        if !path_exists {
+            return CleanupDecision::AlreadyAbsent;
+        }
+
+        if self.can_cleanup_archive(archive_path) {
+            return CleanupDecision::RemoveNow;
+        }
+
+        CleanupDecision::Unsafe
     }
 
     pub fn recovery_actions(&self) -> Vec<RecoveryAction> {
@@ -178,8 +232,8 @@ pub struct StoreCreatePlan {
 
 pub fn choose_strategy(
     probe: CapabilityProbe,
-    seed_exists: bool,
-    real_id: &str,
+    _seed_exists: bool,
+    _real_id: &str,
     request: &StoreCreateRequest,
 ) -> StoreCreatePlan {
     let final_path = request.target_path.clone();

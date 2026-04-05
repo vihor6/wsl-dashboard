@@ -344,6 +344,20 @@ pub async fn perform_install(
                         dashboard.refresh_distros().await;
                         let distros_final = dashboard.get_distros().await;
                         if distros_final.iter().any(|d| d.name == real_id) {
+                            let seed_install_path = executor
+                                .get_distro_install_location(&real_id)
+                                .await
+                                .data;
+                            if let Some(seed_install_path) = seed_install_path.as_ref() {
+                                let _ = crate::store_create::register_owned_path(
+                                    &fallback_journal_path,
+                                    seed_install_path.clone(),
+                                );
+                                let _ = crate::store_create::create_ownership_marker(
+                                    seed_install_path,
+                                    &fallback_journal.operation_id,
+                                );
+                            }
                             let _ = crate::store_create::update_journal_phase(
                                 &fallback_journal_path,
                                 StoreCreatePhase::SeedReady,
@@ -362,6 +376,12 @@ pub async fn perform_install(
                                 terminal_buffer.push_str(&format!("{}\n", i18n::t("install.step_7")));
                                 let unregister_res = executor.execute_command(&["--unregister", &real_id]).await;
                                 if unregister_res.success {
+                                    if let Some(seed_install_path) = seed_install_path.as_ref() {
+                                        let _ = crate::store_create::remove_ownership_marker(
+                                            seed_install_path,
+                                            &fallback_journal.operation_id,
+                                        );
+                                    }
                                     if !final_target_path.is_empty() {
                                         let _ = std::fs::create_dir_all(&final_target_path);
                                         let _ = crate::store_create::create_ownership_marker(
