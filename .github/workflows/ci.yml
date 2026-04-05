@@ -25,5 +25,13 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
-      - name: Build application
-        run: cargo build
+      - name: Build release artifact
+        run: cargo build --release
+
+      - name: Upload Windows build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsldashboard-windows-${{ github.sha }}
+          path: target/release/wsldashboard.exe
+          if-no-files-found: error
+          retention-days: 7
