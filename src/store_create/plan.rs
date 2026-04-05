@@ -16,7 +16,6 @@ pub enum CapabilityProbe {
 pub enum StoreCreateStrategy {
     DirectInstall,
     FreshSeedPromote,
-    ExistingSeedPromote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,10 +183,7 @@ pub fn choose_strategy(
     request: &StoreCreateRequest,
 ) -> StoreCreatePlan {
     let final_path = request.target_path.clone();
-    let can_direct_install = matches!(probe, CapabilityProbe::Supported)
-        && !seed_exists
-        && request.target_name == real_id
-        && request.target_path.trim().is_empty();
+    let can_direct_install = matches!(probe, CapabilityProbe::Supported);
 
     if can_direct_install {
         return StoreCreatePlan {
@@ -203,22 +199,7 @@ pub fn choose_strategy(
                 },
                 archive_path: None,
             },
-            seed_created_by_operation: false,
-        };
-    }
-
-    if seed_exists {
-        let archive_path = archive_path_for(&request.target_path, &operation_fragment(&request.target_name));
-        return StoreCreatePlan {
-            strategy: StoreCreateStrategy::ExistingSeedPromote,
-            final_path: final_path.clone(),
-            archive_path: Some(archive_path.clone()),
-            cleanup: CleanupPlan {
-                owned_distros: vec![request.target_name.clone()],
-                owned_paths: vec![final_path],
-                archive_path: Some(archive_path),
-            },
-            seed_created_by_operation: false,
+            seed_created_by_operation: true,
         };
     }
 

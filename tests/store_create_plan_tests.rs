@@ -18,32 +18,31 @@ fn sample_request() -> StoreCreateRequest {
 }
 
 #[test]
-fn direct_install_requires_supported_probe_and_unmodified_target() {
+fn direct_install_requires_supported_probe() {
     let request = StoreCreateRequest::new("Ubuntu-24.04", "", "Ubuntu-24.04");
 
     let plan = choose_strategy(CapabilityProbe::Supported, false, "Ubuntu-24.04", &request);
     assert_eq!(plan.strategy, StoreCreateStrategy::DirectInstall);
+    assert!(plan.seed_created_by_operation);
 
     let fallback = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
     assert_eq!(fallback.strategy, StoreCreateStrategy::FreshSeedPromote);
 }
 
 #[test]
-fn existing_seed_promote_does_not_claim_the_original_seed() {
+fn direct_install_stays_preferred_even_if_same_store_distro_already_exists() {
     let request = sample_request();
-    let plan = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
+    let plan = choose_strategy(CapabilityProbe::Supported, true, "Ubuntu-24.04", &request);
 
-    assert_eq!(plan.strategy, StoreCreateStrategy::ExistingSeedPromote);
-    assert!(!plan.seed_created_by_operation);
+    assert_eq!(plan.strategy, StoreCreateStrategy::DirectInstall);
     assert_eq!(plan.cleanup.owned_distros, vec![request.target_name.clone()]);
     assert_eq!(plan.cleanup.owned_paths, vec![request.target_path.clone()]);
-    assert!(plan.cleanup.archive_path.is_some());
 }
 
 #[test]
 fn fresh_seed_promote_tracks_created_seed_and_target() {
     let request = sample_request();
-    let plan = choose_strategy(CapabilityProbe::Unknown, false, "Ubuntu-24.04", &request);
+    let plan = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
 
     assert_eq!(plan.strategy, StoreCreateStrategy::FreshSeedPromote);
     assert!(plan.seed_created_by_operation);
@@ -96,7 +95,7 @@ fn cleanup_validation_rejects_unowned_distros_and_paths() {
 fn journal_recovery_actions_cover_only_managed_cleanup_and_reopen() {
     let request = sample_request();
     let plan = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
-    let journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, false);
+    let journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, true);
 
     let actions = journal.recovery_actions();
     assert!(actions.iter().any(|action| matches!(
