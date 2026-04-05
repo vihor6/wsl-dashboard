@@ -152,7 +152,8 @@ fn cleanup_decisions_require_owned_marked_resources_before_removal() {
 fn journal_recovery_actions_cover_only_managed_cleanup_and_reopen() {
     let request = sample_request();
     let plan = choose_strategy(CapabilityProbe::Unknown, true, "Ubuntu-24.04", &request);
-    let journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, true);
+    let mut journal = StoreCreateJournal::new("recover-op-1234", request.clone(), plan.cleanup, true);
+    journal.cleanup.register_owned_path(r"D:\seed-cache\Ubuntu-24.04".to_string());
 
     let actions = journal.recovery_actions();
     assert!(actions.iter().any(|action| matches!(
@@ -166,6 +167,11 @@ fn journal_recovery_actions_cover_only_managed_cleanup_and_reopen() {
     assert!(actions.iter().any(|action| matches!(
         action,
         RecoveryAction::ReopenAddFlow { request: reopened } if reopened == &request
+    )));
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        RecoveryAction::RemoveManagedPath { install_path }
+            if install_path == r"D:\seed-cache\Ubuntu-24.04"
     )));
 }
 

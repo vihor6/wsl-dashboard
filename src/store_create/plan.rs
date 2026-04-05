@@ -201,9 +201,9 @@ impl StoreCreateJournal {
             });
         }
 
-        for install_path in &self.cleanup.owned_paths {
+        if !self.request.target_path.is_empty() && self.cleanup.owns_path(&self.request.target_path) {
             actions.push(RecoveryAction::RemoveManagedPath {
-                install_path: install_path.clone(),
+                install_path: self.request.target_path.clone(),
             });
         }
 
